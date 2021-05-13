@@ -1,0 +1,207 @@
+---
+title: "Figure generation"
+output: html_notebook
+---
+
+```{r}
+source('load_components_tissuemedian.R')
+source('180124_humanSecSupporting.R')
+library(ggpmisc)
+library(ggpubr)
+```
+
+# HPA
+```{r}
+.xlim <- c(-2.5, 2.5)
+load_components(protein.data.source = 'HPA', use.tissue.median = T, return.omics.only = F,
+                secM.expr.col='HPA.tpm_sigmoid_scaled')
+RWR.cols <- setdiff(sapply(prop.int.score.dt, is.numeric) %>% which %>% names, 'int.score.mean.RWR2')
+prop.int.score.dt.quant <- prop.int.score.dt %>%
+  merge(predicted.secP.HPA, by.x= c('Symbol', 'Tissue'), by.y = c('Gene name', 'Tissue')) %>%
+  .[, ( RWR.cols) := lapply(.SD, FUN = function(x) scale(x)[,1]),
+    by = c('int.g', 'use.weights', 'secM.expr.col', 'collapse.by'), .SDcols = RWR.cols]
+
+enrichment.score <- 'int.score.mean.RWR3'
+tableS1a <- prop.int.score.dt.quant[collapse.by == 'secP'][, .(geneSymbol=Symbol, `support score HPA`=get(enrichment.score))]
+
+fig.HPAtpm <-
+  prop.int.score.dt.quant %>%
+  .[!Symbol%in%predicted.secP.HPA[, sum(HPA.tpm), by = 'Gene name'][V1==0, `Gene name`]] %>%
+  .[collapse.by == 'secP'] %>%
+  .[HPA.predicted.type!='intracellular'] %>%
+  .[HPA.predicted.type=='membrane.secreted', HPA.predicted.type:='secreted'] %>%
+  .[!Symbol%in%secM.amir$Symbol] %>% ## do not include secPs that are part of secM
+  .[use.weights == F] %>%
+  # .[int.g == 'PCNet'] %>%
+  .[, {
+    p <- plot.scatter.corr.pub(.SD[, .(enrichment.score = get(enrichment.score),
+                                       expr = 1+HPA.tpm,
+                                       int.score = int.score.mean.RWR2,
+                                       int.g, HPA.predicted.type, use.weights
+    )], return.plot = T, expr.col = 'expr', cor.use.methods = 'spearman', add.density = T,
+    .xlim = .xlim,
+    adj.bw = NULL) +#c(1, 5))
+      ylab('TPM') 
+    plot(p)
+    return(p)
+  }]
+fig.HPAtpm_intracellular <- 
+  prop.int.score.dt.quant %>%
+  .[!Symbol%in%predicted.secP.HPA[, sum(HPA.tpm), by = 'Gene name'][V1==0, `Gene name`]] %>% 
+  .[collapse.by == 'secP'] %>% 
+  .[HPA.predicted.type=='intracellular'] %>% 
+  .[!Symbol%in%secM.amir$Symbol] %>% ## do not include secPs that are part of secM
+  .[use.weights == F] %>% 
+  .[int.g == 'PCNet'] %>% 
+  .[, {
+    p <- plot.scatter.corr.pub(.SD[, .(enrichment.score = get(enrichment.score),
+                                       expr = 1+HPA.tpm,
+                                       int.score = int.score.mean.RWR2,
+                                       int.g, HPA.predicted.type, use.weights
+    )], return.plot = T, expr.col = 'expr', cor.use.methods = 'spearman', add.density = T,
+    .xlim = .xlim,
+    adj.bw = NULL) +#c(1, 5))
+      ylab('TPM') 
+    plot(p)
+    return(p)
+  }]
+
+```
+
+```{r}
+prop.int.score.dt.quant[, HPA.protein.Level:=factor(HPA.protein.Level.numeric, ordered = T, 
+                                                    labels = c('Not detected', 'Not detected - Low',
+                                                               'Low', 'Low - Medium', 
+                                                               'Medium', 'Medium - High',
+                                                               'High'))]
+fig.HPAprotein <- 
+  prop.int.score.dt.quant %>% 
+  .[!is.na(HPA.protein.Level)] %>% 
+  .[as.integer(HPA.protein.Level.numeric)==HPA.protein.Level.numeric,] %>% 
+  # .[!Symbol%in%predicted.secP.HPA[, sum(HPA.tpm), by = 'Gene name'][V1==0, `Gene name`]] %>%
+  .[collapse.by == 'secP'] %>% 
+  .[HPA.predicted.type!='intracellular'] %>% 
+  .[HPA.predicted.type=='membrane.secreted', HPA.predicted.type:='secreted'] %>% 
+  .[!Symbol%in%secM.amir$Symbol] %>% ## do not include secPs that are part of secM
+  .[use.weights == F] %>% 
+  .[int.g == 'PCNet'] %>%
+  # .[int.score.mean.RWR2!=0] %>% 
+  .[,{
+    quant.dt <- .SD[, .(enrichment.score = get(enrichment.score),
+                        int.g, HPA.predicted.type,HPA.protein.Level)]
+    # margin.max <- max(abs(quant.dt$enrichment.score %>% quantile(x_lim_cutoff_probs)))
+    # my_comparisons <- quant.dt$HPA.protein.Level %>% unique() %>% combn(2, simplify = F)
+    my_comparisons <- list(c('Not detected', 'Low'),
+                           c('Low', 'Medium'), 
+                           c('Medium', 'High')
+    )
+    p <- quant.dt %>% 
+      ggplot(aes(HPA.protein.Level, enrichment.score, color = HPA.protein.Level, fill = HPA.protein.Level)) +
+      facet_grid( ~ HPA.predicted.type, scales = 'free') +
+      # scale_color_brewer(palette = "RdYlBu", direction = -1)+
+      ylim(.xlim)  + 
+      guides(color=FALSE)+ 
+      geom_boxplot(alpha = .6, width = .15, outlier.shape = NA) + 
+      geom_violin(alpha = .1) + 
+      stat_compare_means(comparisons = my_comparisons, label = 'p.signif',label.y = c(1, 1.75, 2.5)) + 
+      xlab('protein level') + 
+      ylab('machinery support score')+
+      coord_flip()+
+      theme_bw() %+replace%
+      theme(legend.position="none")
+    plot(p)
+    return(p)
+  }]
+fig.HPAprotein_intracellular <- fig.HPAprotein %+% (prop.int.score.dt.quant %>% 
+                                                      .[!is.na(HPA.protein.Level)] %>% 
+                                                      .[as.integer(HPA.protein.Level.numeric)==HPA.protein.Level.numeric,] %>% 
+                                                      # .[!Symbol%in%predicted.secP.HPA[, sum(HPA.tpm), by = 'Gene name'][V1==0, `Gene name`]] %>% 
+                                                      .[collapse.by == 'secP'] %>% 
+                                                      .[HPA.predicted.type=='intracellular'] %>% 
+                                                      .[!Symbol%in%secM.amir$Symbol] %>% ## do not include secPs that are part of secM
+                                                      .[use.weights == F] %>% 
+                                                      .[int.g == 'PCNet'] %>%
+                                                      # .[int.score.mean.RWR2!=0] %>% 
+                                                      .[,.(enrichment.score = get(enrichment.score),
+                                                           int.g, HPA.predicted.type,HPA.protein.Level)]
+)
+```
+
+
+```{r figure composition}
+library(patchwork)
+fig_support_corr <- (wrap_elements(grid::textGrob('SecP expression', rot=90))|(fig.HPAtpm/fig.HPAprotein))+ plot_layout(widths = c(.25,10))
+ggsave2('Fig2b_support_corr', path.name = 'Figures/', height = 4.5, width = 6.5, plot = fig_support_corr)
+
+fig_support_corr_intracellular <- 
+  (wrap_elements(grid::textGrob('SecP expression', rot=90))|(fig.HPAtpm_intracellular/fig.HPAprotein_intracellular))+ plot_layout(widths = c(.25,5))
+ggsave2('FigS_support_corr_intracellular', path.name = 'Figures/', height = 4.5, width = 4, plot = fig_support_corr_intracellular)
+
+```
+
+
+# Quantitative proteome
+```{r}
+enrichment.score <- 'int.score.mean.RWR3'
+tx.colname <- 'Genes_FPKM'
+protein.colname <- 'Proteins_iBAQ.sigmoid'
+load_components(protein.data.source = 'deep_proteome', use.tissue.median = T, secM.expr.col=protein.colname)
+
+RWR.cols <- setdiff(sapply(prop.int.score.dt, is.numeric) %>% which %>% names, 'int.score.mean.RWR2')
+prop.int.score.dt.quant <- prop.int.score.dt %>%
+  merge(predicted.secP.HPA, by.x= c('Symbol', 'Tissue'), by.y = c('Gene name', 'Tissue')) %>%
+  .[, ( RWR.cols) := lapply(.SD, FUN = function(x) scale(x)[,1]),
+    by = c('int.g', 'use.weights', 'secM.expr.col', 'collapse.by'), .SDcols = RWR.cols]
+
+tableS1b <- prop.int.score.dt.quant[collapse.by == 'secP'][, .(geneSymbol=Symbol, `support score Deep Proteome`=get(enrichment.score))]
+figQproteinGeneExp <- 
+  prop.int.score.dt.quant %>% 
+  .[!Symbol%in%predicted.secP.HPA[, sum(get(tx.colname)), by = 'Gene name'][V1==0, `Gene name`]] %>% 
+  .[collapse.by == 'secP'] %>% 
+  .[HPA.predicted.type=='membrane.secreted', HPA.predicted.type:='secreted'] %>%
+  .[!Symbol%in%secM.amir$Symbol] %>% ## do not include secPs that are part of secM
+  .[use.weights == F] %>% 
+  # .[int.g == 'PCNet'] %>%
+  .[, {
+    p <- plot.scatter.corr.pub(.SD[, .(enrichment.score = get(enrichment.score),
+                                       expr = 1+get(tx.colname),
+                                       int.score = int.score.mean.RWR2,
+                                       int.g, HPA.predicted.type, use.weights
+    )], return.plot = T, expr.col = 'expr', cor.use.methods = 'spearman',
+    .xlim = .xlim,
+    filter0 = F)+ ylab('SecP gene expression')
+    #c(1, 5))
+    plot(p)
+    return(p)
+  }]
+```
+```{r}
+figQproteinProtExp <- 
+  prop.int.score.dt.quant %>% 
+  .[!Symbol%in%predicted.secP.HPA[, sum(get(protein.colname)), by = 'Gene name'][V1==0, `Gene name`]] %>% 
+  .[collapse.by == 'secP'] %>% 
+  .[HPA.predicted.type=='membrane.secreted', HPA.predicted.type:='secreted'] %>% 
+  .[!Symbol%in%secM.amir$Symbol] %>% ## do not include secPs that are part of secM
+  .[use.weights == F] %>% 
+  # .[int.g == 'PCNet'] %>%
+  .[, {
+    p <- plot.scatter.corr.pub(.SD[, .(enrichment.score = get(enrichment.score),
+                                       expr = 1+get(protein.colname),
+                                       # int.score = int.score.mean.RWR2,
+                                       int.g, HPA.predicted.type, use.weights
+    )], return.plot = T, expr.col = 'expr', cor.use.methods = 'spearman',
+    .xlim = .xlim,filter0 = F) + ylab('SecP protein expression (TPM)')
+    #+ scale_y_continuous()#c(1, 5))
+    plot(p)
+    return(p)
+  }]
+```
+```{r figure composition 2}
+FigQprotein <- figQproteinGeneExp/figQproteinProtExp
+ggsave2('FigQprotein', path.name = 'Figures/', plot = FigQprotein, height = 6, width = 9)
+```
+
+```{r}
+merge(tableS1a, tableS1b, by='geneSymbol', all=T) %>% fwrite('TableS_support_scores.csv')
+```
+

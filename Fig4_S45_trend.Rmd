@@ -1,0 +1,688 @@
+---
+title: "Stepwise support score"
+output: html_notebook
+---
+
+```{r}
+source('ppi_assist_func.R')
+source('2019_AD_aux.R')
+library(data.table)
+library(magrittr)
+library(ggplot2)
+```
+
+# load data
+```{r load MSBB}
+genExp.Symbol.dt <- rio::import('databases/2019_AD_MSBB/AD_MSBB_sigmoidExp.feather') %>% as.data.table() %>% 
+  setnames('geneSymbol', 'gene')
+MSBB_sigmoidExp <- cbind(genExp.Symbol.dt[, .(colheader1=gene)], genExp.Symbol.dt)
+
+clinVar <- fread('databases/2019_AD_MSBB/MSBB_clinical.csv')
+RNA_corvar <- fread('databases/2019_AD_MSBB/MSBB_RNAseq_covariates_November2018Update.csv') %>% 
+  .[, -c('synapseId', 'fileName', 'fileType')] %>% unique %>% 
+  .[, UID:=paste0(batch, '.', sampleIdentifier)]
+clin_RNA <- merge(clinVar, RNA_corvar, by= 'individualIdentifier')
+## expression set
+library(Biobase)
+expr.mat <- genExp.Symbol.dt %>% dt.to.df() %>% as.matrix()
+# MSBB.exprset[,colnames(MSBB.exprset)%in%clin_RNA$UID] ## subsetting for those that have a valid clinRNA name
+pheno.dt <- clin_RNA[colnames(expr.mat), on='UID']
+pheno.dt[!is.na(PlaqueMean), PlaqueMean.quantile:= rank(PlaqueMean)/.N] 
+pheno.dt[, PlaqueMean.50_50:=ifelse(PlaqueMean.quantile>.5, '>50','<50')]
+pheno.data <- new("AnnotatedDataFrame", data=dt.to.df(pheno.dt, rn.col = 'UID'))
+MSBB.exprSet <- ExpressionSet(assayData = expr.mat,
+                              phenoData=pheno.data)
+```
+
+```{r load RWR}
+RWR.stationary <- fread('output/2005_AD_all/MSBB_normExp_sigmoid/RWR_secPs_geneLevel.csv') %>% 
+  # RWR.stationary <- fread('output/190915_AD_MSBB/RWR_allSecPs_stationary_colab.csv') %>% 
+  setnames(c('V1', 'V2', 'V3'), c('secP', 'ID', 'grad.type')) %>% 
+  melt(id.vars= c('secP', 'ID', 'grad.type'), variable.name= 'geneSymbol') %>% dcast(secP+ID+geneSymbol~grad.type, value.var='value') %>% merge(pheno.dt[, .(ID=UID, BrodmannArea)], by='ID')
+RWR.stationary[, p_k__stationary_dist:=p_k/stationary_dist]
+RWR.stationary[, p_k__stationary_RWR3:=p_k/stationary_dist_RWR3]
+
+RWR.summary.stat.stationary <- RWR.stationary[geneSymbol%in%genExp.Symbol.dt$gene, lapply(.SD, mean), by=.(secP,geneSymbol), .SDcols= c('p_k', 'stationary_dist', 'stationary_dist_RWR3')]
+RWR.summary.stat.stationary[secP=='APP', .(geneSymbol, `secretory support component score` = p_k)][order(geneSymbol)] %>% fwrite('~/AD_secretory/Tables/TableS_APP_component_scores.csv')
+RWR.summary.stat.stationary.by_BM <- 
+  RWR.stationary[!is.na(BrodmannArea)][geneSymbol%in%genExp.Symbol.dt$gene, lapply(.SD, mean), by=.(secP,geneSymbol, BrodmannArea), .SDcols= c('p_k', 'stationary_dist', 'stationary_dist_RWR3')]
+RWR.summary.stat.stationary.by_BM.sd <-
+  RWR.stationary[!is.na(BrodmannArea)][geneSymbol%in%genExp.Symbol.dt$gene, lapply(.SD, sd), by=.(secP,geneSymbol, BrodmannArea), .SDcols= c('p_k', 'stationary_dist', 'stationary_dist_RWR3')]
+
+merge(RWR.summary.stat.stationary.by_BM,
+      RWR.summary.stat.stationary.by_BM.sd[, .(secP, geneSymbol, BrodmannArea, p_k_sd = p_k)]) %>% fwrite('output/200522_stepwise_MSBB_SC/RWR.summary.stat.stationary.by_BM.csv')
+```
+
+
+```{r RWR genomic location}
+
+anno.table <- annotables::grch37 %>% as.data.table() %>% .[, .(chr, start, end, anno_symbol=symbol)] %>% .[chr%in%c(1:23, 'X', 'Y')] %>% unique ## sex chromosomes excluded
+APP_genomic.loc.dt <- merge(RWR.summary.stat.stationary[secP=='APP'], anno.table, by.x = 'geneSymbol', by.y = 'anno_symbol')
+```
+
+
+## differential expression analysis for MSBB
+### all brain regions
+```{r 50-50 split}
+library(viper)
+signature <- rowTtest(MSBB.exprSet, "PlaqueMean.50_50", '>50', '<50')
+signature.dt <- merge(signature$statistic %>% as.data.table(keep.rownames = 'geneSymbol') %>% setnames('V1', 't.statistic'),
+                      signature$p.value %>% as.data.table(keep.rownames = 'geneSymbol') %>% setnames('V1', 'p.value'))
+signature.dt %>% fwrite('output/190915_AD_MSBB/MSBB_signature.csv')
+```
+### brain region specific
+```{r}
+signature.by_BM.dt <- 
+  parallel::mclapply(c('BM10', 'BM22', 'BM36', 'BM44') %>% `names<-`(.,.), function(BMregion){  
+    MSBB.exprSet.subset <- MSBB.exprSet[,which(MSBB.exprSet$BrodmannArea==BMregion)]
+    signature <- rowTtest(MSBB.exprSet.subset, "PlaqueMean.50_50", '>50', '<50')
+    signature.dt <- merge(signature$statistic %>% as.data.table(keep.rownames = 'geneSymbol') %>% setnames('V1', 't.statistic'),
+                          signature$p.value %>% as.data.table(keep.rownames = 'geneSymbol') %>% setnames('V1', 'p.value'))
+  }, mc.cores = 4) %>% rbindlist(idcol='BrodmannArea')
+```
+
+```{r}
+RWR.stat.fc.dt <- RWR.summary.stat.stationary %>% merge(signature.dt, by='geneSymbol')
+RWR.stat.fc.by_BM.dt <- RWR.summary.stat.stationary %>% merge(signature.by_BM.dt, by='geneSymbol')
+```
+
+## core network export
+```{r}
+RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP][order(-p_k)][, .(geneSymbol, rank=rank(-p_k), p_k)] %>% 
+  fwrite('output/2020_IPA_AD/corenetwork_ranked_MSBB.csv')
+
+used.int.g <- readRDS('output/int.db.g.RDS')[['PCNet']]
+
+RWR.stat.fc.dt[, ID:='sample.mean']
+RWR.stat.fc.dt[, p_k__stationary_dist:=p_k/stationary_dist]
+RWR.stat.fc.dt[, p_k__stationary_RWR3:=p_k/stationary_dist_RWR3]
+RWR.stat.fc.dt[, p_k_rank:=rank(p_k), by='secP']
+focus.secP='APP'
+set.seed(1)
+secP.specific.network.genes <- c('APP', RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP][order(-p_k)][1:20, geneSymbol], 
+                                 RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP][order(-p_k)][, sample(geneSymbol, 95)]) %>% unique
+full.sec.ingG <- igraph::induced.subgraph( ## essentially removing all other secPs to prevent cross-talk
+  used.int.g, 
+  intersect(RWR.stat.fc.dt$geneSymbol, names(igraph::V(used.int.g))
+  )
+) %>% igraph::induced.subgraph(igraph::degree(.) > 0)
+
+
+int.g.induced <- igraph::induced.subgraph( ## essentially removing all other secPs to prevent cross-talk
+  full.sec.ingG, 
+  intersect(secP.specific.network.genes, names(igraph::V(full.sec.ingG))
+  )
+) %>% igraph::induced.subgraph(igraph::degree(.) > 0)
+
+Fig4a_netrwork_toygraphs <- 
+  draw.diff.network(int.g.induced = int.g.induced, focus.secP = focus.secP,
+                    genExp.Symbol.dt = genExp.Symbol.dt %>%
+                      melt(id.vars='gene', value.name = 'sigmoidExp') %>%
+                      setnames('gene', 'geneSymbol') %>% 
+                      .[, .(UID='sample.mean', 
+                            sigmoidExp=mean(sigmoidExp)
+                      ),by=.(geneSymbol)],
+                    RWR.grad = RWR.stat.fc.dt[secP==focus.secP] %>%
+                      melt(measure.vars=c('p_k', 'p_k_rank',
+                                          'stationary_dist',
+                                          'stationary_dist_RWR3',
+                                          'p_k__stationary_dist'
+                      ),
+                      variable.name='grad.type', value.name='value'), 
+                    secM.components = RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP][order(-p_k)][1:20, geneSymbol],## node highlighting
+                    seed=6, color.divergent=F,
+                    neighbor.degree =2, label.text.size=2, plt.toy.network = T,
+                    highlightUID = 'sample.mean', reset_APP_p_k = F, layout = 'target',
+                    plot.grad = 'p_k',
+                    plot.expr = 'sigmoidExp', scale.lim.prob = c(0,1)
+  ) 
+ggsave2('netrwork_focus', '~/AD_secretory/Figures/', plot = Fig4a_netrwork_toygraphs[[2]]+coord_fixed(), width = 14, height = 10)
+```
+
+# support sweep
+## all brain regions
+```{r expression sweep}
+enrich.stepwise.dt <- 
+  enrich.step.1d(RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP],
+                 n.cores=32, cumulative.t.statistic = T,
+                 enrich = 'TF',TF.enrich.p.adj.method = 'fdr', TF.enrich.sig = .05,
+                 x.col.name='p_k')
+enrich.stepwise.dt[, t.stat.mean.upper:=t.stat.mean+t.stat.sd]
+enrich.stepwise.dt[, t.stat.mean.lower:=t.stat.mean-t.stat.sd]
+
+```
+## TF analysis
+```{r GWAS formatting, eval=FALSE, include=FALSE}
+GWAS.stage1 <- fread('databases/2019_AD_GWAS/Nat_genetics_2019_pvalue/Kunkle_etal_Stage1_results.txt')[!is.na(MarkerName)]
+GWAS.stage2 <- fread('databases/2019_AD_GWAS/Nat_genetics_2019_pvalue/Kunkle_etal_Stage2_results.txt')[!is.na(MarkerName)]
+GWAS.stage1[, .(Chromosome, MarkerName, 0, Position, Effect_allele, Non_Effect_allele)] %>%
+  fwrite('databases/2019_AD_GWAS/Nat_genetics_2019_pvalue/Kunkle_etal_Stage1_results.bim', col.names = F, sep = '\t')
+GWAS.stage2[, .(Chromosome, MarkerName, 0, Position, Effect_allele, Non_Effect_allele)] %>%
+  fwrite('databases/2019_AD_GWAS/Nat_genetics_2019_pvalue/Kunkle_etal_Stage2_results.bim', col.names = F, sep='\t')
+GWAS.stage1[, .(SNP=MarkerName, P=Pvalue)] %>%
+  fwrite('databases/2019_AD_GWAS/Nat_genetics_2019_pvalue/Kunkle_etal_Stage1_results.PV', sep = '\t')
+GWAS.stage2[, .(SNP=MarkerName, P=Pvalue)] %>%
+  fwrite('databases/2019_AD_GWAS/Nat_genetics_2019_pvalue/Kunkle_etal_Stage2_results.PV', sep = '\t')
+
+GWAS_Jansen <- fread('databases/2019_AD_GWAS/AD_sumstats_Jansenetal_2019sept.txt.gz')
+GWAS_Jansen[, .(SNP, P)] %>% fwrite('databases/2019_AD_GWAS/GWAS_Jansen.PV', sep='\t')
+GWAS_Jansen[, .(CHR, SNP, 0, BP, A1, A2)] %>%
+  fwrite('databases/2019_AD_GWAS/Nat_genetics_2019_pvalue/GWAS_Jansen.bim', col.names = F, sep = '\t')
+```
+
+```{r output for FUMA_GWAS, eval=FALSE, include=FALSE}
+combined.GWAS.summary.stat <- 
+  rbind(GWAS.stage1[, .(Chromosome, Position, rsID=MarkerName, Pvalue, A1=Effect_allele, A2=Non_Effect_allele, Beta, SE)], 
+        GWAS.stage2[, .(Chromosome, Position, rsID=MarkerName, Pvalue, A1=Effect_allele, A2=Non_Effect_allele, Beta, SE)],
+        GWAS_Jansen[, .(Chromosome=CHR, Position=BP, rsID=SNP, Pvalue=P, A1, A2, Beta=BETA, SE)])
+combined.GWAS.summary.stat.collapsed <- 
+  combined.GWAS.summary.stat[, .(Beta=mean(Beta), SE=mean(SE), Pvalue=fisher.method(Pvalue)), by=.(Chromosome, Position, rsID, A1, A2)]
+
+combined.GWAS.summary.stat.collapsed.min <- 
+  combined.GWAS.summary.stat[, .(Beta=mean(Beta), SE=mean(SE), Pvalue=min(Pvalue)), by=.(Chromosome, Position, rsID, A1, A2)]
+
+combined.GWAS.summary.stat.collapsed %>% rio::export('databases/2019_AD_GWAS/combined.GWAS.summary.stat.collapsed.fst')
+
+GWAS.stage1[, .(Chromosome, Position, rsID=MarkerName, Pvalue, A1=Effect_allele, A2=Non_Effect_allele, Beta, SE)] %>% 
+  fwrite('databases/2019_AD_GWAS/FUMA_kunkle_stage1.csv')
+GWAS.stage2[, .(Chromosome, Position, rsID=MarkerName, Pvalue, A1=Effect_allele, A2=Non_Effect_allele, Beta, SE)] %>% 
+  fwrite('databases/2019_AD_GWAS/FUMA_kunkle_stage2.csv')
+
+```
+
+```{r GWAS association}
+pv.nat_genetics.stage1.dt <- fread('databases/2019_AD_GWAS/Nat_genetics_2019_pvalue/Kunkle_etal_Stage1_results.PVout.genes.out') %>%
+  setnames('P', 'P1')
+pv.nat_genetics.stage2.dt <- fread('databases/2019_AD_GWAS/Nat_genetics_2019_pvalue/Kunkle_etal_Stage2_results.PVout.genes.out') %>%
+  setnames('P', 'P2')
+pv.jansen.dt <- fread('databases/2019_AD_GWAS/GWAS_Jansen.PVout.genes.out')
+
+library(org.Hs.eg.db)
+hs <- org.Hs.eg.db
+
+pv.nat_genetics_all <- ## Jensen 2019 included
+  merge(pv.nat_genetics.stage1.dt[, .(GENE=as.character(GENE), CHR, START, STOP, P1)], 
+        pv.nat_genetics.stage2.dt[, .(GENE=as.character(GENE), CHR, START, STOP, P2)], 
+        by=c('GENE', 'CHR', 'START', 'STOP'), all=T) %>% 
+  merge(pv.jansen.dt[, .(GENE=as.character(GENE), CHR, START, STOP, P3=P)], 
+        by=c('GENE', 'CHR', 'START', 'STOP'), all=T) %>% 
+  .[, P:= fisher.method(P1, P2,P3), by=.(GENE, CHR, START, STOP)] %>%
+  # .[, P:=min(P1, P2, na.rm = T), by=.(GENE, CHR, START, STOP)] %>%
+  merge(select(hs, 
+               keys = .$GENE,
+               columns = c("SYMBOL", "ENTREZID" ),
+               keytype = "ENTREZID") %>% as.data.table(), by.x='GENE', by.y='ENTREZID')
+
+pv.nat_genetics_all.noDuplicates <- pv.nat_genetics_all[, .(P=min(P)),by=SYMBOL]
+# pv.nat_genetics_all.noDuplicates[,Padj:= p.adjust(P,method = 'fdr')]
+
+AD_gwas_catelog <- fread('databases/2019_AD_GWAS/GWAS_catelog/gwas-association-downloaded_2019-10-17-EFO_0000249-withChildTraits.tsv')
+LOAD_gwas_catelog <- fread('databases/2019_AD_GWAS/GWAS_catelog/gwas-association-downloaded_2019-10-17-EFO_1001870.tsv')
+
+
+combined.GWAS <- rbind(AD_gwas_catelog[!`REPORTED GENE(S)`%in%c('intergenic', 'Intergenic', 'NR'), 
+                                       .(SYMBOL = parse.semicol.sep(`REPORTED GENE(S)`, split.text = '; |;|, |,')), 
+                                       by=.(`REPORTED GENE(S)`, P=`P-VALUE`)][, -'REPORTED GENE(S)'],
+                       LOAD_gwas_catelog[!`REPORTED GENE(S)`%in%c('intergenic', 'Intergenic', 'NR'), 
+                                         .(SYMBOL = parse.semicol.sep(`REPORTED GENE(S)`, split.text = '; |;|, |,')), 
+                                         by=.(`REPORTED GENE(S)`, P=`P-VALUE`)][, -'REPORTED GENE(S)'],
+                       pv.nat_genetics_all.noDuplicates) %>% 
+  .[!is.na(SYMBOL)] %>% 
+  .[, .(P=fisher.method(P)),by=SYMBOL] %>% 
+  .[, Padj:=p.adjust(P, method='fdr')]
+
+AD_risk_genes_genomeWide <- combined.GWAS[P<5e-8, SYMBOL]
+AD_risk_genes_suggestive <- combined.GWAS[P<1e-5, SYMBOL]
+AD_risk_genes_FDR <- combined.GWAS[Padj<.05, SYMBOL]
+```
+
+
+```{r GWAS sweep}
+
+GWAS_GWSig.stepwise.dt_NULLbkg <- 
+  enrich.step.1d(RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP], plot = T, n.cores=32, cumulative.t.statistic = F,
+                 enrich = 'TF',TF.enrich.p.adj.method = 'fdr', TF.enrich.sig = .05, gmt.lists = gmt.lists,
+                 AD_genes = AD_risk_genes_genomeWide,
+                 hyper.lookup = NULL,#readRDS('hyper.lookup.rds'),
+                 background = NULL,
+                 secondary.background = NULL,
+                 enrich.server = 'fisher.exact',
+                 x.col.name='p_k')
+GWAS_FDRSig.stepwise.dt_NULLbkg <- 
+  enrich.step.1d(RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP], plot = T, n.cores=32, cumulative.t.statistic = F,
+                 enrich = 'TF',TF.enrich.p.adj.method = 'fdr', TF.enrich.sig = .05, gmt.lists = gmt.lists,
+                 AD_genes = AD_risk_genes_FDR,
+                 hyper.lookup = NULL,#readRDS('hyper.lookup.rds'),
+                 background = NULL,
+                 secondary.background = NULL,
+                 enrich.server = 'fisher.exact',
+                 x.col.name='p_k')
+GWAS_suggestiveSig.stepwise.dt_NULLbkg <- 
+  enrich.step.1d(RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP], plot = T, n.cores=32, cumulative.t.statistic = F,
+                 enrich = 'TF',TF.enrich.p.adj.method = 'fdr', TF.enrich.sig = .05, gmt.lists = gmt.lists,
+                 AD_genes = AD_risk_genes_suggestive,
+                 hyper.lookup = NULL,#readRDS('hyper.lookup.rds'),
+                 background = NULL,
+                 secondary.background = NULL,
+                 enrich.server = 'fisher.exact',
+                 x.col.name='p_k')
+GWAS.stepwise.dt_NULLbkg_consensus <-
+  enrich.step.1d(RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP], plot = T, n.cores=32, cumulative.t.statistic = F,
+                 enrich = 'TF',TF.enrich.p.adj.method = 'fdr', TF.enrich.sig = .05, gmt.lists = gmt.lists,
+                 AD_genes = fread('databases/2019_AD_GWAS/consensus.csv'),
+                 hyper.lookup = NULL,#readRDS('hyper.lookup.rds'),
+                 background = NULL,
+                 secondary.background = NULL,
+                 enrich.server = 'fisher.exact',
+                 x.col.name='p_k')
+
+combined_GWAS.stepwise.dt <- GWAS.stepwise.dt_NULLbkg_consensus %>% 
+  merge(GWAS_GWSig.stepwise.dt_NULLbkg[, -c('risk gene significance', 'sorted.TF')], by = 'k', suffixes = c('_consensus', '_GWsig')) %>%
+  merge(GWAS_FDRSig.stepwise.dt_NULLbkg[, -c('risk gene significance', 'sorted.TF')], by = 'k', suffixes = c('', '_FDRSig')) %>% 
+  merge(GWAS_suggestiveSig.stepwise.dt_NULLbkg[, -c('risk gene significance', 'sorted.TF')], by = 'k', suffixes = c('', '_SuggestiveSig'))
+```
+
+
+## brain region specific
+```{r}
+enrich.stepwise.by_BM.dt <- 
+  RWR.stat.fc.by_BM.dt %>% split(by='BrodmannArea') %>% parallel::mclapply(
+    function(RWR.stat.fc.by_BM.dt){
+      enrich.step.1d(RWR.stat.fc.by_BM.dt[secP=='APP'&geneSymbol!=secP],
+                     n.cores=8, cumulative.t.statistic = T,
+                     enrich = 'TF',TF.enrich.p.adj.method = 'fdr', TF.enrich.sig = .05,
+                     AD_genes = fread('databases/2019_AD_GWAS/AD_risk_genes_OLD.csv')$AD_risk_genes,
+                     x.col.name='p_k')
+      
+    }, mc.cores = 4
+  ) %>% rbindlist(idcol = 'BrodmannArea')
+
+enrich.stepwise.by_BM.dt[, t.stat.mean.upper:=t.stat.mean+t.stat.sd]
+enrich.stepwise.by_BM.dt[, t.stat.mean.lower:=t.stat.mean-t.stat.sd]
+```
+
+# progressive secM support sweep
+```{r}
+indexed.RWR.stat <- RWR.summary.stat.stationary[secP=='APP'&geneSymbol!=secP][, proximity_rank_p_k:=rank(-p_k)] %>% setkey(proximity_rank_p_k)
+
+all.samples.indexed.RWR <- merge(RWR.stationary[secP=='APP'&geneSymbol!=secP], indexed.RWR.stat[,.(secP, geneSymbol, proximity_rank_p_k)], by=c('secP', 'geneSymbol')) %>% setkey(proximity_rank_p_k)
+
+secM.amir <- fread(here::here('databases','Human_components_feizi.csv')) %>% setnames('gene_name', 'Symbol')
+secMs <- secM.amir$Symbol %>% unique
+
+progressive.support.scores.dt <- 
+  parallel::mclapply(seq_along(indexed.RWR.stat$proximity_rank_p_k), function(index.cutoff){
+    all.samples.indexed.RWR[proximity_rank_p_k<=index.cutoff][geneSymbol%in%secMs, .(progressive_support.score=sum(p_k), index.cutoff=index.cutoff), by=ID]
+  }, mc.cores = 32) %>% rbindlist()
+progressive.support.scores.dt[, progressive_support.score.scaled:=progressive_support.score/max(progressive_support.score), by=ID]
+progressive.support.scores.dt_clinRNA <- merge(progressive.support.scores.dt, clin_RNA, by.x='ID', by.y='UID')
+```
+## calculate cumulative contribution
+```{r}
+cumulative.support <- 
+  merge( progressive.support.scores.dt[, .(ID, progressive_support.score.right=progressive_support.score.scaled,
+                                           index.cutoff)],## calculate differentials
+         rbind(data.table(ID=unique(progressive.support.scores.dt$ID),
+                          progressive_support.score.scaled=0, index.cutoff=0),
+               progressive.support.scores.dt[index.cutoff<=max(progressive.support.scores.dt$index.cutoff)-1, 
+                                             .(ID, progressive_support.score.scaled, index.cutoff)]) %>% 
+           .[, .(ID, progressive_support.score.left=progressive_support.score.scaled, index.cutoff=index.cutoff+1)],
+         by=c('ID', 'index.cutoff')) %>% 
+  .[ ,support.score.contribution:=progressive_support.score.right-progressive_support.score.left]
+
+FigS_contribution <- 
+  cumulative.support[, .(progressive_support.contribution= mean(support.score.contribution), sd = sd(support.score.contribution)),by=index.cutoff] %>% ggplot(aes(index.cutoff, progressive_support.contribution)) + geom_col() + 
+  geom_errorbar(aes(ymin = progressive_support.contribution - sd, ymax = progressive_support.contribution + sd)) +
+  theme_bw() + 
+  # ggforce::facet_zoom(xlim = c(0,100)) +
+  scale_y_continuous(labels = scales::percent) + xlab('Module size (n)') + ylab('Contribution to support score')
+
+# ggsave2('FigS_contribution', '~/AD_secretory/Figures/', height = 6, width = 8, plot = FigS_contribution)
+```
+# figure composition
+```{r}
+library(patchwork)
+
+## top 1000 most proximal proteins
+sweep.tstat <- 
+  enrich.stepwise.dt %>% ggplot(aes(k, t.stat.mean)) + geom_line() + geom_ribbon(aes(ymin=t.stat.mean.lower,
+                                                                                     ymax=t.stat.mean.upper), alpha=.25)   +
+  # xlab('Module size (n)') + 
+  ylab('Average diff. expr.') +
+  geom_hline(yintercept = 0, linetype='dashed', alpha=.3) +theme_bw() %+replace% theme(axis.title.x = element_blank())
+
+
+FigS_all_GWAS_cutoffs_grids <- 
+  rbind(GWAS_GWSig.stepwise.dt_NULLbkg[, `risk gene significance`:='genome-wide significance (P<5e-8)'],
+        GWAS_suggestiveSig.stepwise.dt_NULLbkg[, `risk gene significance`:='suggestive significance (P<1e-5)'],
+        GWAS_FDRSig.stepwise.dt_NULLbkg[, `risk gene significance`:='FDR significance (FDR P<0.05)']) %>%
+  .[, `risk gene significance`:=factor(`risk gene significance`, levels= c('genome-wide significance (P<5e-8)',
+                                                                           'suggestive significance (P<1e-5)',
+                                                                           'FDR significance (FDR P<0.05)'))] %>% 
+  .[!is.infinite(OR)] %>% split(by='risk gene significance') %>% lapply(function(.)
+  {
+    ggplot(data=., aes(k, OR)) + 
+      geom_point(aes(size=hyper.pv, alpha=hyper.pv, color=OR)) + 
+      scale_color_gradient2(trans=scales::log10_trans(), low = "blue", mid = "grey90",
+                            high = "red", space = "Lab") +
+      # geom_ribbon(aes(ymin=l.confInt, ymax = r.confInt))+
+      scale_y_log10() + 
+      facet_grid(`risk gene significance`~.) +
+      ggforce::facet_zoom(xlim=c(1, 200), zoom.size = 1.25) +
+      ggtitle(label = unique(.$`risk gene significance`))+
+      # stat_smooth(method='glm', formula = 'y ~ log(x)', n=10000, fullrange = T)+
+      geom_hline(yintercept = 1, linetype='dashed', alpha=.5)+ 
+      xlab('Module size (n)') +
+      ylab('Odds ratio')+
+      scale_size(trans = pv.trans, name = 'p-value', breaks = c(.05, .5, 1), labels = c(.05, .5, 1)) +
+      scale_alpha(trans = pv.trans, guide=NULL) +
+      guides(size = guide_legend(override.aes = list(linetype = 0))) + 
+      theme_bw()# %+replace% theme(axis.title.x = element_blank())
+  })
+FigS_all_GWAS_cutoffs <- gridExtra::grid.arrange(FigS_all_GWAS_cutoffs_grids[[1]],
+                                                 FigS_all_GWAS_cutoffs_grids[[2]],
+                                                 FigS_all_GWAS_cutoffs_grids[[3]], ncol=1)
+ggsave2('FigS_all_GWAS_cutoffs', '~/AD_secretory/Figures/', plot = FigS_all_GWAS_cutoffs, height = 16, width = 8)
+
+
+GWAS_GWSig.stepwise.dt_NULLbkg[!is.infinite(OR)] %>% {
+  ggplot(data=., aes(k, OR, size=hyper.pv, alpha=hyper.pv, color=OR)) + 
+    geom_point() + scale_color_gradient2(trans=scales::log10_trans(), low = "blue", mid = "grey90",
+                                         high = "red", space = "Lab") +
+    scale_y_log10() + 
+    stat_smooth(method='glm', formula = 'y ~ log(x)', n=10000, fullrange = T)+
+    geom_hline(yintercept = 1, linetype='dashed', alpha=.5)+ 
+    xlab('Module size (n)') +
+    ylab('Odds ratio')+
+    scale_size(trans = pv.trans, name = 'p-value', breaks = c(.05, .5, 1), labels = c(.05, .5, 1)) + scale_alpha(trans = pv.trans, guide=NULL) +
+    guides(size = guide_legend(override.aes = list(linetype = 0))) + 
+    theme_bw()# %+replace% theme(axis.title.x = element_blank())
+}
+
+
+sweep_Focus_GWSig.stepwise.dt_NULLbkg <- 
+  GWAS_GWSig.stepwise.dt_NULLbkg[k<150] %>% {
+    ggplot(data=., aes(k, OR, color=hyper.pv)) + 
+      geom_point(data = .[!is.infinite(OR)], alpha=.75) + 
+      # geom_ribbon(aes(ymin=l.confInt, ymax = r.confInt))+
+      scale_color_gradient2('FET p-value', trans=scales::log10_trans(), low = "blue", mid = "grey90",
+                            high = "red", space = "Lab") +
+      # scale_y_log10() + 
+      stat_smooth(data = .[k>15], method='glm', formula = 'y ~ log(x)', n=10000, fullrange = F)+
+      geom_hline(yintercept = 1, linetype='dashed', alpha=.5)+ 
+      ylab('Odds ratio')+
+      xlab('Module size (n)') +
+      # scale_alpha(trans = pv.trans, guide=NULL, ) +
+      guides(size = guide_legend(override.aes = list(linetype = 0))) + 
+      theme_bw() #%+replace% theme(legend.position = 'top')
+  }
+Fig_stepwiseFocus_pvalues <-
+  GWAS_GWSig.stepwise.dt_NULLbkg[k<150] %>% {
+    ggplot(data=., aes(k, hyper.pv, color=OR)) +
+      geom_point(data = .[!is.infinite(OR)], alpha=.75) +
+      # geom_ribbon(aes(ymin=l.confInt, ymax = r.confInt))+
+      scale_color_gradient2('OR', trans=scales::log10_trans(), low = "blue", mid = "grey90",
+                            high = "red", space = "Lab") +
+      scale_y_log10() + 
+      geom_vline(xintercept = 20, linetype='dashed', alpha=.5) + 
+      # stat_smooth(data = .[k>15], method='glm', formula = 'y ~ log(x)', n=10000, fullrange = F)+
+      # geom_hline(yintercept = 1, linetype='dashed', alpha=.5)+
+      ylab('FET p-value')+
+      xlab('Module size (n)') +
+      # scale_alpha(trans = pv.trans, guide=NULL, ) +
+      guides(size = guide_legend(override.aes = list(linetype = 0))) +
+      theme_bw() #%+replace% theme(legend.position = 'top')
+  }
+
+ggsave2('Fig_stepwiseFocus_pvalues', '~/AD_secretory/Figures/', plot = Fig_stepwiseFocus_pvalues, height = 4, width = 8)
+
+
+
+Fig_stepwiseFocus <- 
+  ((
+    (Fig4a_netrwork_toygraphs[[2]] + coord_fixed())/
+      (sweep.tstat+ coord_cartesian(xlim=c(NA, 150), ylim=c(-2, 2)) )/
+      (sweep_Focus_GWSig.stepwise.dt_NULLbkg+ xlim(NA,200) + coord_cartesian(xlim=c(NA,150)))
+  ) + plot_annotation(tag_levels = 'A')) +
+  plot_layout(heights= c(14,8,8), nrow=3) 
+ggsave2('Fig_stepwiseFocus', '~/AD_secretory/Figures/', plot = Fig_stepwiseFocus, width = 8, height = 8)
+
+
+FigS_stepwisetstat.byBM <- 
+  enrich.stepwise.by_BM.dt[k>5] %>% ggplot(aes(k, t.stat.mean, color=BrodmannArea, fill=BrodmannArea)) +
+  geom_line() + geom_ribbon(aes(ymin=t.stat.mean.lower,
+                                ymax=t.stat.mean.upper), alpha=.25, color = NA)   +
+  xlab('Module size (n)') +
+  ylab('Average diff. expr.') +
+  geom_hline(yintercept = 0, linetype='dashed', alpha=.3) +theme_bw() 
+
+FigS_stepwiseALL <- 
+  (FigS_contribution/(sweep.tstat+ coord_cartesian(ylim=c(-2, 2)))/ FigS_stepwisetstat.byBM) + plot_annotation(tag_levels = 'A')
+ggsave2('FigS_stepwiseALL', '~/AD_secretory/Figures/', plot = FigS_stepwiseALL, width = 8, height = 9)
+
+```
+
+#localization enrichment
+```{r}
+RWR.grad <- fread('output/190915_AD_MSBB/RWR_grad_allSecPs_V3.csv') %>% #RWR_grad_allSecPs.csv
+  setnames(c('V1', 'V2', 'V3'), c('secP', 'ID', 'grad.type')) %>% 
+  melt(id.vars=c('secP', 'ID', 'grad.type'), variable.name='geneSymbol') %>% 
+  .[, lapply(.SD, mean), by = .(geneSymbol, secP, grad.type), .SDcols= 'value'] %>% 
+  dcast(secP+geneSymbol~grad.type)
+#load localization geneset
+subcellular_location <- fread('databases/HPA/subcellular_location.tsv', na.strings = '') %>%
+  .[, parse.localiation(.SD), by = c('Gene', 'Gene name')]
+subcellular_locationnew <- fread('databases/HPA/subcellular_location_201911.tsv', na.strings = '') %>%
+  .[, parse.localiation(.SD), by = c('Gene', 'Gene name')]
+
+## background filtering
+localization.pathway <- subcellular_locationnew[`Gene name`%in%RWR.grad[secP=='APP',geneSymbol]][as.integer(Reliability)>0] %>%
+  split(by='localization') %>% lapply(function(x) unique(x$`Gene name`))
+ranks <- RWR.grad[geneSymbol!='APP'] %>% 
+  .[secP=='APP'] %>% 
+  .[, .(geneSymbol, transformed_p_k = scale(p_k))] %>%
+  tibble::deframe() %>% scale(center = F) %>% .[,1]
+
+localization.gseaRes <- fgsea::fgsea(pathway=localization.pathway, stats = ranks, nperm = 10000, nproc =  32)
+FigS_gsea_localization <- 
+  fgsea::plotGseaTable(localization.pathway[localization.gseaRes[size>15][order(-NES), pathway]], ranks, localization.gseaRes, gseaParam = .5, render = F)
+ggsave2('FigS_gsea_localization', '~/AD_secretory/Figures/', plot = FigS_gsea_localization, height = 8, width = 8)
+# save.image('Figure2020/Fig4_S45_trend_20201128.RDA', compress = T)
+save.image('Figure2020/Fig4_S45_trend_20210214.RDA', compress = T)
+```
+
+Epigenetics marker analysis
+```{r}
+library(Homo.sapiens)
+
+## nature neuroscience: methylation
+NN_meth.dt <- fread('Figure2020/Revision/NN_meth_supplemental.csv', skip = 3)[, chr:= paste0('chr', Chr)] %>% 
+  .[, padj:=fisher.method(`AD_p-value`, `NP_model1_p-value`, `NP_model3_p-value`), by = `Target ID`]
+NN_meth_GR <- GenomicRanges::makeGRangesFromDataFrame(NN_meth.dt[, .(chr, start = Position, end = Position, `Target ID`)], ignore.strand = T)
+
+
+## nature
+Nat_conserved_epigenomic <- readxl::read_excel("Figure2020/Revision/Nat_conserved_epigenomic_41586_2015_BFnature14252_MOESM150_ESM.xlsx", skip = 1, na = c('', NA)) %>% as.data.table %>% 
+  .[!is.na(`hg chr`)]
+
+Nat_conserved_epigenomic %>% ## writing bedgraphs
+  {
+    m.dt <- melt(., measure.vars = patterns(lfc = '^lfc_', padj = '^adjp_'), variable.name = 'corr_') 
+    levels(m.dt$corr_) <- factor(gsub('^lfc_', '', grep('^lfc_', names(.), value = T)))
+    m.dt
+  } %>% 
+  .[, fwrite(.(chr, start, stop, lfc), sprintf('Figure2020/Revision/diff_epigenetics/Nat_conserved_%s_%s_lfc.bdg', state, corr_), sep = '\t'), by = .(state, corr_)]
+## grange mapping
+Nat_epi_GR <- GenomicRanges::makeGRangesFromDataFrame(Nat_conserved_epigenomic[, .(chr = `hg chr`, start = `hg start`, end = `hg stop`, `Unique ID`)], ignore.strand = T)
+mergedIR <- IRanges::mergeByOverlaps(Nat_epi_GR, genes(TxDb.Hsapiens.UCSC.hg19.knownGene::TxDb.Hsapiens.UCSC.hg19.knownGene)) %>%{
+  cbind(.$Nat_epi_GR %>% as.data.table, data.table(gene_id = .$`genes(TxDb.Hsapiens.UCSC.hg19.knownGene::TxDb.Hsapiens.UCSC.hg19.knownGene)`$gene_id)) %>%
+    merge(as.data.table(org.Hs.egSYMBOL))
+}
+Nat_epigenomic_mapped <- merge(Nat_conserved_epigenomic, unique(mergedIR), by.x = c('hg chr', 'hg start', 'hg stop'), by.y = c('seqnames', 'start', 'end')) %>%
+  {
+    m.dt <- melt(., measure.vars = patterns(lfc = '^lfc_', padj = '^adjp_'), variable.name = 'corr_') 
+    levels(m.dt$corr_) <- factor(gsub('^lfc_', '', grep('^lfc_', names(.), value = T)))
+    m.dt
+  } %>% .[, Classification:= fcase(state%like%'H3K27me3', 'Polycomb', state%like%'H3K27ac', 'Enhancer', state%like%'H3K4me3', 'Promoter', default = 'Other')] %>% 
+  .[, `Histone mark`:= tstrsplit(state, '_')[[1]]]
+Nat_epigenomic_mapped_geneMin <- Nat_epigenomic_mapped[, .SD[which.min(padj)], by = .(symbol, state, corr_, Classification)]
+
+conserved_epigenetics_enrich.dt <- 
+  Nat_epigenomic_mapped_geneMin[corr_== 'Ckp25', enrich.step.1d(RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP], plot = T, n.cores=1, cumulative.t.statistic = F,
+                                                                enrich = 'gmtTarget',TF.enrich.p.adj.method = 'fdr', TF.enrich.sig = .005,
+                                                                gmt.lists = .SD, #Nat_epigenomic_mapped_geneMin[state=='H3K27ac_enh' & corr_ == '2Wk'],
+                                                                background = T,
+                                                                enrich.server = 'fisher.exact',
+                                                                x.col.name='p_k'),
+                                by = .(`Histone mark`, Classification, corr_)]
+
+NN_H3K9ac_domains <- readxl::read_excel("Figure2020/Revision/H3K9ac/41593_2018_291_MOESM4_ESM-2.xls", 
+                                        col_types = c("text", "text", "numeric", 
+                                                      "numeric", "numeric", "text", "numeric", 
+                                                      "numeric")) %>% as.data.table
+NN_H3K9ac_amyloid <- readxl::read_excel("Figure2020/Revision/H3K9ac/NN_H3K9ac_41593_2018_291_MOESM5_ESM-3.xls", 
+                                        sheet = "Amyloid", skip = 2) %>% as.data.table
+NN_H3K9ac_tau <- readxl::read_excel("Figure2020/Revision/H3K9ac/NN_H3K9ac_41593_2018_291_MOESM5_ESM-3.xls", 
+                                    sheet = "Tau", skip = 2) %>% as.data.table
+
+NN_H3K9ac_all <- rbind(NN_H3K9ac_amyloid[, corr_ := 'amyloid'],
+                       NN_H3K9ac_tau[, corr_ := 'tau']) #%>% 
+NN_H3K9ac_GR <- GenomicRanges::makeGRangesFromDataFrame(NN_H3K9ac_domains[, .(chr = paste0('chr', Chr), start=Start, end = End)], ignore.strand = T)
+NN_H3K9ac_mergedIR <- IRanges::mergeByOverlaps(NN_H3K9ac_GR, genes(TxDb.Hsapiens.UCSC.hg19.knownGene::TxDb.Hsapiens.UCSC.hg19.knownGene)) %>%{
+  cbind(.$NN_H3K9ac_GR %>% as.data.table, data.table(gene_id = .$`genes(TxDb.Hsapiens.UCSC.hg19.knownGene::TxDb.Hsapiens.UCSC.hg19.knownGene)`$gene_id)) %>%
+    merge(as.data.table(org.Hs.egSYMBOL))
+} %>% merge(NN_H3K9ac_domains[, .(start= Start, end = End, seqnames= paste0('chr',Chr), Classification)], by = c('start', 'end', 'seqnames'))
+
+
+NN_H3K9ac_all_mapped <- merge(NN_H3K9ac_all[, .(chr = paste0('chr', Chr), start=Start, end = End, pvalue = `p value`, padj = FDR, Coefficient, `Mean count`, corr_)], 
+                              unique(NN_H3K9ac_mergedIR), by.x = c('chr', 'start', 'end'), by.y = c('seqnames', 'start', 'end')) %>% 
+  .[, `Histone mark`:= 'H3K9ac']
+
+bkg_allgenes <- NN_H3K9ac_mergedIR$symbol %>% unique
+
+NN_H3K9ac_enrich_domain.dt <- NN_H3K9ac_all_mapped[, 
+                                                   enrich.step.1d(RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP], 
+                                                                  plot = T, n.cores=1, cumulative.t.statistic = F,
+                                                                  enrich = 'gmtTarget',TF.enrich.p.adj.method = 'fdr', TF.enrich.sig = 1,
+                                                                  gmt.lists = .SD, #Nat_epigenomic_mapped_geneMin[state=='H3K27ac_enh' & corr_ == '2Wk'],
+                                                                  background = unique(NN_H3K9ac_mergedIR[, .(domain = Classification, symbol)])[domain==Classification, symbol], ## stratify bkg
+                                                                  enrich.server = 'fisher.exact',
+                                                                  x.col.name='p_k')
+                                                   ,by = .(`Histone mark`, corr_, Classification)]
+
+## AD multi-Omics
+AD_multiOmics_acetylation.dt <- 
+  list(readxl::read_excel("Figure2020/Revision/AD_multiOmics/GSE130746_Summary.MTL.result.log2.xlsx", 
+                          sheet = "H3K9ac.MTL.result.log2") %>% as.data.table %>% .[, `Histone mark`:='H3K9ac'] %>% {setnames(., names(.), gsub('H3K9ac.', '', names(.)))},
+       readxl::read_excel("Figure2020/Revision/AD_multiOmics/GSE130746_Summary.MTL.result.log2.xlsx", 
+                          sheet = "H3K27ac.MTL.result.log2") %>% as.data.table %>% .[, `Histone mark`:='H3K27ac'] %>% {setnames(., names(.), gsub('H3K27ac.', '', names(.)))},
+       readxl::read_excel("Figure2020/Revision/AD_multiOmics/GSE130746_Summary.MTL.result.log2.xlsx", 
+                          sheet = "H3K122ac.MTL.result.log2") %>% as.data.table %>% .[, `Histone mark`:= 'H3K122ac'] %>% {setnames(., names(.), gsub('H3K122ac.', '', names(.)))}
+  ) %>% rbindlist() %>% melt(measure.vars = c('PHO-HY', 'PHA-HO', 'anova'), variable.name = 'study.group', value.name = 'padj') %>% 
+  .[, study.group:=factor(study.group, levels = c( 'anova', 'PHO-HY', 'PHA-HO'), labels = c('All changes', 'Old v. Young', 'AD v. Old'))] %>% 
+  .[!Locus%like%'random'&!is.na(Genes)] %>% 
+  .[, Classification:=ifelse(Distance>1000, 'Enhancer', 'Promoter')] %>% 
+  setnames('Genes', 'symbol')
+
+AD_multiOmics_Enrich.dt <- AD_multiOmics_acetylation.dt[, enrich.step.1d(RWR.stat.fc.dt[secP=='APP'&geneSymbol!=secP], 
+                                                                         plot = T, n.cores=1, cumulative.t.statistic = F,
+                                                                         enrich = 'gmtTarget',TF.enrich.p.adj.method = 'fdr', TF.enrich.sig = .05,
+                                                                         gmt.lists = .SD, #Nat_epigenomic_mapped_geneMin[state=='H3K27ac_enh' & corr_ == '2Wk'],
+                                                                         background = 
+                                                                           AD_multiOmics_acetylation.dt[, .(domain = `Histone mark`, sg = study.group, class = Classification,
+                                                                                                            symbol)][sg == study.group & domain==`Histone mark`, unique(symbol)], ## stratify bkg
+                                                                         enrich.server = 'fisher.exact',
+                                                                         x.col.name='p_k')
+                                                        ,by = .(study.group, `Histone mark`)]
+
+Fig_epigenetic_enhancer <- 
+  rbind(NN_H3K9ac_enrich_domain.dt, conserved_epigenetics_enrich.dt) %>%
+  .[!Classification%in%c('Other','Polycomb')] %>%
+  .[, Classification:= factor(Classification, levels = c('Promoter', 'Enhancer'))] %>%
+  .[, corr_:=factor(corr_, levels = c('amyloid', 'Ckp25', 'tau'), labels = c('Aβ', 'Ckp25', 'tau'))] %>%
+  .[corr_ != 'tau'] %>% 
+  .[, `Histone mark`:= factor(`Histone mark`, levels = c('H3K4me3', 'H3K27ac', 'H3K9ac'), ordered = T)] %>% 
+  .[k>2&OR>0] %>% #split(by = 'corr_') %>% lapply(function(.){
+  ggplot(aes(k, OR)) +
+  geom_jitter(aes(size=hyper.pv, alpha=hyper.pv, color =OR, shape = `Histone mark`)) +
+  scale_color_gradient2(name = 'Odds ratio', trans=scales::log10_trans(), low = "blue", mid = "grey90",
+                        high = "red", space = "Lab",  limits=c(1/2, 2), oob=scales::squish) +
+  scale_shape_discrete(solid=F) +
+  # scale_color_discrete(drop=F)+
+  # geom_ribbon(aes(ymin=l.confInt, ymax = r.confInt))+
+  scale_y_log10() +
+  facet_grid(corr_~Classification) +
+  geom_hline(yintercept = 1, linetype='dashed', alpha=.5)+
+  xlab('Module size (n)') +
+  ylab('Odds ratio')+
+  scale_size(trans = pv.trans, name = 'FET p-value', breaks = c(.01, 0.05, .25,  .5), labels = c(.01, 0.05, .25, .5)) +
+  scale_alpha(trans = pv.trans, guide=NULL) +
+  guides(size = guide_legend(override.aes = list(linetype = 0))) +
+  theme_bw()# %+replace% theme(axis.title.x = element_blank())
+ggsave2(file.name = 'Fig_epigenetic_enhancer', path.name = '~/AD_secretory/Figures/Revision/', plot =Fig_epigenetic_enhancer, height = 5, width = 7)
+
+FigS_epigenetic_AgeAD <- AD_multiOmics_Enrich.dt %>% 
+  .[k>2&OR>0] %>% #split(by = 'corr_') %>% lapply(function(.){
+  ggplot(aes(k, OR)) +
+  geom_point(aes(size=hyper.pv, alpha=hyper.pv, color =OR, shape = `Histone mark`)) +
+  scale_color_gradient2(name = 'Odds ratio', trans=scales::log10_trans(), low = "blue", mid = "grey90",
+                        high = "red", space = "Lab",  limits=c(1/2, 2), oob=scales::squish) +
+  scale_shape_discrete(solid=F) +
+  # scale_color_discrete(drop=F)+
+  # geom_ribbon(aes(ymin=l.confInt, ymax = r.confInt))+
+  scale_y_log10() +
+  facet_grid(study.group~`Histone mark`) +
+  # ggforce::facet_zoom(xlim=c(1, 500), zoom.size = 1.25) +
+  # ggtitle(label = unique(.$`risk gene significance`))+
+  # stat_smooth(method='glm', formula = 'y ~ log(x)', n=10000, fullrange = T)+
+  geom_hline(yintercept = 1, linetype='dashed', alpha=.5)+
+  xlab('Module size (n)') +
+  ylab('Odds ratio')+
+  scale_size(trans = pv.trans, name = 'FET p-value', breaks = c(.01, 0.05, .25,  .5), labels = c(.01, 0.05, .25, .5)) +
+  scale_alpha(trans = pv.trans, guide=NULL) +
+  guides(size = guide_legend(override.aes = list(linetype = 0))) +
+  theme_bw()# %+replace% theme(axis.title.x = element_blank())
+ggsave2(file.name = 'FigS_epigenetic_AgeAD', path.name = '~/AD_secretory/Figures/Revision/', plot =FigS_epigenetic_AgeAD, height = 5, width = 7)
+
+
+
+```
+
+```{r}
+motif_loc.dt <- fread('Figure2020/Revision/AD_motif_alighment.csv')[, .(seqname = Sequence, chr = tstrsplit(Locus, ':')[[1]], start = tstrsplit(tstrsplit(Locus, ':')[[2]], '-')[[1]],
+                                                                        end =  tstrsplit(tstrsplit(Locus, ':')[[2]], '-')[[2]])]
+motif_loc_GR <- GenomicRanges::makeGRangesFromDataFrame(motif_loc.dt, seqnames.field = 'seqname', ignore.strand = T)
+# overlap_delta = 100000
+overlap_delta = 1000
+## NN methylation
+
+NN_meth_GR <- GenomicRanges::makeGRangesFromDataFrame(NN_meth.dt[, .(`Target ID`, chr = Chr, start = Position -overlap_delta, end = Position + overlap_delta)], seqnames.field = 'Target ID', keep.extra.columns = T, ignore.strand = T)
+IRanges::mergeByOverlaps(NN_meth_GR, motif_loc_GR)
+## H3K9ac genomic overlap
+NN_H3K9ac_all[Symbols%in%c('XPO1', 'ARF1', 'HSPA8', 'JUN', 'P4HB', 'RAB1A', 'CANX', 'HSP90AA1')]
+NN_H3K9ac_all_GR <- GenomicRanges::makeGRangesFromDataFrame(NN_H3K9ac_all[, .(`Domain ID`, chr = Chr, start=Start- overlap_delta, end = End + overlap_delta,
+                                                                              Coefficient, `p value`, FDR, Class, corr_
+                                                                              
+)], seqnames.field = 'Domain ID', keep.extra.columns = T)
+IRanges::mergeByOverlaps(NN_H3K9ac_all_GR, motif_loc_GR)
+## AD multi-omics genomic overlap
+
+AD_multiOmics_acetylation_GR <- GenomicRanges::makeGRangesFromDataFrame(
+  list(readxl::read_excel("Figure2020/Revision/AD_multiOmics/GSE130746_Summary.MTL.result.log2.xlsx", 
+                          sheet = "H3K9ac.MTL.result.log2") %>% as.data.table %>% .[, type:='H3K9ac'] %>% {setnames(., names(.), gsub('H3K9ac.', '', names(.)))},
+       readxl::read_excel("Figure2020/Revision/AD_multiOmics/GSE130746_Summary.MTL.result.log2.xlsx", 
+                          sheet = "H3K27ac.MTL.result.log2") %>% as.data.table %>% .[, type:='H3K27ac'] %>% {setnames(., names(.), gsub('H3K27ac.', '', names(.)))},
+       readxl::read_excel("Figure2020/Revision/AD_multiOmics/GSE130746_Summary.MTL.result.log2.xlsx", 
+                          sheet = "H3K122ac.MTL.result.log2") %>% as.data.table %>% .[, type:= 'H3K122ac'] %>% {setnames(., names(.), gsub('H3K122ac.', '', names(.)))}
+  ) %>% rbindlist()  %>%
+    .[!Locus%like%'random'&!is.na(Genes)] %>% .[, .(seqname = Genes, chr = tstrsplit(Locus, ':')[[1]], 
+                                                    start = as.integer(tstrsplit(tstrsplit(Locus, ':')[[2]], '-')[[1]]) - overlap_delta,
+                                                    end =  as.integer(tstrsplit(tstrsplit(Locus, ':')[[2]], '-')[[2]]) + overlap_delta,
+                                                    HY, HO, HA, `HO-HY`, `HA-HO`, `PHO-HY`, `PHA-HO`, anova, category, type)],
+  seqnames.field = 'seqname', keep.extra.columns = T)
+
+IRanges::mergeByOverlaps(AD_multiOmics_acetylation_GR, motif_loc_GR) %>% as.data.table() %>% 
+  .[PHO.HY<.1|PHA.HO<.1|anova<.1]
+
+```
+

@@ -1,0 +1,369 @@
+---
+title: "AD_coefficients"
+output: html_notebook
+---
+
+```{r}
+source('ppi_assist_func.R')
+source('graph_assist.R')
+source('bayes_model_aux.R')
+# source('GSEA.R')
+# library(BiocParallel)
+library(igraph)
+# library(plotly)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(rethinking)
+```
+# Fig 3A- single cells
+```{r}
+
+subject.summary <- fread('databases/2019_AD_singleCell/Subject_summary.csv')
+clinVar <- fread('databases/2019_AD_singleCell/ClinVar.csv')
+clinVarROSMAP <- fread('databases/2019_AD_ROSMAP/ROSMAP_Clinical_2019-05_v3.csv')
+TAG_patientID.dt <- fread('databases/2019_AD_singleCell/id_mapping.csv') %>% .[, .(projid, Subject)] %>% unique
+gene.symbols <-  readLines("databases/2019_AD_singleCell/filtered_gene_row_names.txt")
+gene.symbol.dt <- data.table(gene.id = seq_along(gene.symbols), geneSymbol = gene.symbols)
+filtered.colMetadata <- fread("databases/2019_AD_singleCell/filtered_column_metadata.txt")[, sample.id:=seq_along(TAG)]
+CDR.dt <- fread('databases/2019_AD_singleCell/CDR.dt.csv')
+# all.subject.info <- merge(subject.summary, clinVar, by='Subject')
+```
+Count data manipulation
+
+data.table(to.keep = intersect(filtered.counts.dt.merged$geneSymbol, unique(c('APP', unique(c(secM.python$secM.components, secM.components)), all.secretory.resident.genes)))) %>% fwrite('Figure2020/Revision/output/sec_related_genes.csv')
+```{r eval=FALSE, include=FALSE}
+filtered.counts.dt <- fread("databases/2019_AD_singleCell/filtered_count_matrix.mtx", skip = 2) %>% 
+  setnames(c('gene.id', 'sample.id', 'counts'))
+CDR.dt <- filtered.counts.dt[, .(CDR = .N), by = sample.id]
+fwrite(CDR.dt, 'databases/2019_AD_singleCell/CDR.dt.csv')
+filtered.counts.dt.merged <- filtered.counts.dt %>% 
+  merge(gene.symbol.dt, by='gene.id') %>%
+  merge(filtered.colMetadata[, .(TAG,
+                                 sample.id, 
+                                 pre.cluster,
+                                 broad.cell.type,
+                                 Subcluster, projid)], by='sample.id')
+
+gene.id.symbols <-  fread("databases/2019_AD_singleCell/notfiltered_gene_row_names.txt", col.names = c('ensg.id', 'geneSymbol'), header = F)
+gene.length.dt <- fread('databases/2019_AD_singleCell/gene.length.dt.csv')
+gene.length.symbol.dt <- merge(gene.id.symbols, gene.length.dt)[!is.na(length), .(mean.length= mean(length)), by=geneSymbol]
+filtered.counts.dt.merged <- merge(filtered.counts.dt.merged, gene.length.symbol.dt, by='geneSymbol')
+filtered.counts.dt.merged[, lengthNormalized.counts:=counts/mean.length]
+
+filtered.counts.dt.merged %>% dcast(geneSymbol~TAG, value.var='counts', fill=0) %>% fwrite('output/190908_AD/AD_sc_counts.csv')
+tpm.df <- filtered.counts.dt.merged %>% dcast(geneSymbol~TAG, value.var='lengthNormalized.counts', fill=0) #%>% dt.to.df()
+tpm.df.norm <- cbind(tpm.df[, .(geneSymbol)], tpm.df[, lapply(.SD, function(x) 1e6*x/sum(x)), .SDcols=!'geneSymbol'])
+APP_norm <- tpm.df.norm[geneSymbol=='APP'] %>% melt(id.vars='geneSymbol', value.name='APP_TPM', 
+                                                    variable.name='TAG')
+APP_norm %>% fwrite('output/190908_AD/APP_norm.csv')
+tpm.df.norm %>% fwrite('output/190908_AD/AD_sc_TPM.csv')
+sigmoid.tpm <- cbind(tpm.df.norm[, .(geneSymbol)],
+                     tpm.df.norm[, lapply(.SD, function(tpm) sigmoid(scale(log(1+tpm))[,1])), .SDcols=!'geneSymbol'])
+sigmoid.tpm %>% fwrite('output/190908_AD/AD_sc_sigmoidTPM.csv')
+```
+
+## RWR from GPU
+```{r eval=FALSE, include=FALSE}
+library(rethinking)
+aggr.to.use <- 'APP'
+amyloid_genExp <- fread(sprintf('output/190908_AD/%s_norm.csv', aggr.to.use))
+## run expression-guided random walk to generate RWR_secPs_summarized.csv 
+RWR_counts_log_sigmoid <- fread('output/2005_AD_all/SC_counts_log_sigmoid/RWR_secPs_summarized.csv') %>% setnames(c('V1', 'V2', 'V3', 'secM_avg'), c('aggr', 'TAG', 'summ.type', 'p_k'))
+RWR_counts_log_sigmoid[, .(`amyloidogenic protein` = aggr, TAG, `support score` = p_k)] %>% fwrite('Tables/TableS_AD_SC.csv')
+RWR_tpm <- fread('output/2005_AD_all/SC_tpm_None/RWR_secPs_summarized.csv') %>% setnames(c('V1', 'V2', 'V3', 'secM_avg'), c('aggr', 'TAG', 'summ.type', 'p_k'))
+RWR_all <- merge(RWR_counts_log_sigmoid, RWR_tpm, by=c('aggr', 'TAG'), suffixes = c('.log_sigmoid' ,'.tpm')) %>% 
+  .[aggr==aggr.to.use]
+```
+
+## Reactive astrocytes
+Marker gene: GFAP
+```{r eval=FALSE, include=FALSE}
+sigmoid.tpm <- fread('output/190908_AD/AD_sc_sigmoidTPM.csv')
+activ.dt <- sigmoid.tpm[geneSymbol%in%c('APP', 'GFAP'), .SD, .SDcols=c('geneSymbol', filtered.colMetadata[, TAG])] %>% melt(variable.name='TAG') %>% dcast(TAG~geneSymbol) %>% merge(filtered.colMetadata, by='TAG')
+activ.dt[,broad.cell.type.react:= broad.cell.type]
+activ.dt[GFAP>.6 & broad.cell.type=='Ast', broad.cell.type.react:='ReactAst']
+
+RWR_raw.clinVar.dt_ReactAst <- RWR_all %>% 
+  merge(activ.dt[, .(TAG, projid, broad.cell.type, broad.cell.type.react,sample.id)], by='TAG') %>%
+  merge(TAG_patientID.dt, by='projid') %>% 
+  merge(clinVar, by='Subject') %>% 
+  merge(amyloid_genExp[, -'geneSymbol'], by='TAG') %>% 
+  merge(CDR.dt, by = 'sample.id')
+RWR_raw.clinVar.dt_ReactAst2 <- merge(RWR_raw.clinVar.dt_ReactAst, clinVarROSMAP, by = 'projid', all.x = T, suffixes = c('', '.ROSMAP'))
+cell.types.highlight <-  c('Ast', 'End', 'Ex', 'In', 'Mic')
+model.dt_ReactAst <- RWR_raw.clinVar.dt_ReactAst2[!is.na(pmi), .(Subject_id = as.integer(factor(Subject)),
+                                                                 gender = as.integer(factor(msex)),
+                                                                 pmi = scale(pmi)[,1],
+                                                                 CDR = scale(CDR)[,1],
+                                                                 Broad_cellType = as.integer(factor(broad.cell.type)),
+                                                                 Broad_cellType_react = as.integer(factor(broad.cell.type.react)),
+                                                                 # Subcluster = as.integer(factor(Subcluster)),
+                                                                 amyloid = scale(amyloid)[,1],
+                                                                 tangles = scale(tangles)[,1],
+                                                                 plaq_n = scale(plaq_n)[,1],
+                                                                 support_score_countsLogSigmoid = scale(p_k.log_sigmoid)[,1],
+                                                                 genExp_APP = scale(log(1+get(sprintf('%s_TPM', aggr.to.use))))[,1], ## aggr gene expression
+                                                                 progression = scale(as.integer(factor(pathology.group, levels = c('no-pathology',
+                                                                                                                                   'early-pathology',
+                                                                                                                                   'late-pathology'))))[,1],
+                                                                 AD_control = ifelse(pathology.group=='no-pathology', 1, 2)
+)] #%>% na.omit
+model.factor.lookup_ReactAst <- RWR_raw.clinVar.dt_ReactAst2[!is.na(pmi), .(Subject_id = as.integer(factor(Subject)),
+                                                                            Subject,
+                                                                            gender = as.integer(factor(msex)),
+                                                                            msex,
+                                                                            pmi,
+                                                                            CDR,
+                                                                            Broad_cellType = as.integer(factor(broad.cell.type)),
+                                                                            Broad_cellType_react = as.integer(factor(broad.cell.type.react)),
+                                                                            broad.cell.type,
+                                                                            broad.cell.type.react,
+                                                                            progression = scale(as.integer(factor(pathology.group, levels = c('no-pathology',
+                                                                                                                                              'early-pathology',
+                                                                                                                                              'late-pathology'))))[,1],
+                                                                            pathology.group,
+                                                                            AD_control = ifelse(pathology.group=='no-pathology', 1, 2),
+                                                                            ad_control = ifelse(pathology.group=='no-pathology', 'control', 'AD')
+                                                                            # Subcluster = as.integer(factor(Subcluster)),
+                                                                            # Subcluster
+)] %>% unique #%>% na.omit()
+
+options(mc.cores = parallel::detectCores())
+
+m.multilevel.amyloid_ReactAst2_pmi <- ulam(
+  alist(
+    amyloid ~ dnorm(mu, sigma),
+    mu <- a+a_pmi * pmi +a_gender * gender + a_CDR * CDR + b_RWR3[Broad_cellType_react] * support_score_countsLogSigmoid + b_genExp[Broad_cellType] * genExp_APP,
+    sigma ~ dexp(1),
+    a ~  dnorm(0, 1),
+    a_pmi ~ dnorm(0,1),
+    a_gender ~ dnorm(0,1),
+    a_CDR ~ dnorm(0,1),
+    b_RWR3[Broad_cellType_react] ~ dnorm(b_RWR3_bar, b_RWR3_sigma),
+    b_RWR3_bar ~ dnorm(0, 1),
+    b_RWR3_sigma ~ dexp(1),
+    
+    b_genExp[Broad_cellType] ~ dnorm(b_genExp_bar, b_genExp_sigma),
+    b_genExp_bar ~ dnorm(0, 1),
+    b_genExp_sigma ~ dexp(1)
+  ), data = model.dt_ReactAst, chains=16 , cores=16, iter = 5000
+)
+
+
+m.multilevel.amyloid_ReactAst2_pmi_ADcontrol2 <- ulam(
+  alist(
+    amyloid ~ dnorm(mu, sigma),
+    mu <- a+a_pmi * pmi +a_gender * gender + a_CDR * CDR +b_RWR3[Broad_cellType_react, AD_control] * support_score_countsLogSigmoid + b_genExp[Broad_cellType_react] * genExp_APP,
+    sigma ~ dexp(1),
+    a ~  dnorm(0, 1),
+    a_pmi ~ dnorm(0,1),
+    a_gender~ dnorm(0,1),
+    a_CDR ~ dnorm(0,1),
+    b_age~dnorm(0,1),
+    vector[2]:b_RWR3[Broad_cellType_react] ~ multi_normal(0, Rho_RWR3, b_RWR3_sigma),
+    Rho_RWR3 ~ dlkjcorr(4),
+    # b_RWR3_bar ~ dnorm(0, 1),
+    b_RWR3_sigma ~ dexp(1),
+    # vector[2]:b_genExp[Broad_cellType] ~ multi_normal(0, Rho_genExp, b_genExp_sigma),
+    b_genExp[Broad_cellType_react] ~ dnorm(b_genExp_bar, b_genExp_sigma),
+    # Rho_genExp ~ dlkjcorr(4),
+    b_genExp_bar ~ dnorm(0, 1),
+    b_genExp_sigma ~ dexp(1)
+  ), data = model.dt_ReactAst, chains=16 , cores=16, cmdstan = T
+)
+
+
+
+plt.Ast <- plot.dist.customCellTerm(m.multilevel.amyloid_ReactAst2_pmi, 
+                                    model.factor.lookup = model.factor.lookup_ReactAst, 
+                                    cellTermLookup_highlight = cell.types.highlight,
+                                    color.dist = T)  + guides( color=FALSE) +
+  ggrepel::geom_text_repel(data = data.frame(x = c(-0.171779080417017, -.05),
+                                             y = c(5, 5),
+                                             label = c("reactive", 'resting'),
+                                             coef = c('support score', 'support score'),
+                                             coef.gene = c("APP","APP"), AstState= c('reactive', 'resting')),
+                           mapping = aes(x = x, 
+                                         y = y, label = label, 
+                                         color=AstState),inherit.aes = FALSE, 
+                           nudge_y      = -0.005,    # direction    = "x",
+                           show.legend = FALSE) + theme_bw() %+replace% theme(legend.position = 'bottom')
+
+coef.dt <- rbind(
+  unique(model.factor.lookup_ReactAst[broad.cell.type%in%cell.types.highlight,
+                                      .(ct = broad.cell.type.react, ctf = Broad_cellType_react)])[, c('coef.type', 'coef.name', 
+                                                                                                      'plt.coef'):=.('support score', sprintf('b_RWR3[%s]', ctf), 
+                                                                                                                     paste0('b_support_score_', ct))],
+  unique(model.factor.lookup_ReactAst[broad.cell.type%in%cell.types.highlight, 
+                                      .(ct = broad.cell.type, ctf= Broad_cellType)])[, c('coef.type', 'coef.name', 'plt.coef'):=.('mRNA diff. expr.', sprintf('b_genExp[%s]', ctf),
+                                                                                                                                  paste0('b_APP_diff_expr_', ct))])
+coef.dt_AD_control <- rbind(
+  coef.dt[coef.type=='support score', .(coef.name = sprintf('%s[%s,%s]', 'b_RWR3', ctf, 1:2), plt.coef = paste0(plt.coef, '_', c('control', 'AD'))), by = .(ct, coef.type,ctf)],
+  coef.dt[coef.type!='support score', .(coef.name, plt.coef, ct, coef.type, ctf)])
+
+plt.Ast.allTerms <- m.multilevel.amyloid_ReactAst2_pmi@stanfit %>% plot(pars = c(coef.dt$coef.name, 'sigma', 'a', 'a_pmi', 'a_gender'))
+
+
+FigS_SCallTerms <- m.multilevel.amyloid_ReactAst2_pmi@stanfit %>%
+  bayesplot::mcmc_intervals(pars = c(coef.dt$coef.name, 'sigma', 'a', 'a_pmi', 'a_gender', 'a_CDR'))+ 
+  scale_y_discrete(
+    labels=coef.dt[, `names<-`(plt.coef , coef.name)]
+  ) + theme_bw()
+ggsave2(path.name = 'Figures/', file.name = 'FigS_SCallTerms', height = 4, width = 12, plot = FigS_SCallTerms)
+)
+
+
+FigS_SCallTerms_AD_control <- m.multilevel.amyloid_ReactAst2_pmi_ADcontrol2@stanfit %>%
+  bayesplot::mcmc_intervals(pars = c(coef.dt_AD_control$coef.name, 'sigma', 'a', 'a_pmi', 'a_gender', 'a_CDR'))+ 
+  scale_y_discrete(
+    labels=coef.dt_AD_control[, `names<-`(plt.coef , coef.name)]
+  ) + theme_bw()
+ggsave2(path.name = 'Figures/', file.name = 'FigS_SCallTerms_AD_control', height = 4, width = 12, plot = FigS_SCallTerms_AD_control)
+)
+```
+
+# Bulk-RNAseq from MSBB
+##load clinical covariates
+```{r}
+clinVar <- fread('databases/2019_AD_MSBB/MSBB_clinical.csv')
+RNA_corvar <- fread('databases/2019_AD_MSBB/MSBB_RNAseq_covariates_November2018Update.csv') %>% 
+  .[, -c('synapseId', 'fileName', 'fileType')] %>% unique %>% 
+  .[, UID:=paste0(batch, '.', sampleIdentifier)]
+clin_RNA <- merge(clinVar, RNA_corvar, by= 'individualIdentifier')
+genExp.dt <- lapply(c('10', '22', '36', '44') %>% `names<-`(.,.), function(BM_region){
+  fread(sprintf(
+    'databases/2019_AD_MSBB/NormalizedExpression/AMP-AD_MSBB_MSSM_BM_%s.normalized.sex_race_age_RIN_PMI_exonicRate_rRnaRate_batch_adj.tsv', BM_region)) %>% setnames('V1', 'ensgid') %>% melt(id.vars='ensgid', variable.name='UID')
+}) %>% rbindlist(idcol = 'BrodmannArea') %>% 
+  .[, BrodmannArea:=paste0('BM', BrodmannArea)] %>% 
+  .[, c('batch', 'sampleIdentifier'):=tstrsplit(UID, '\\.')]
+
+# ensgid to symbol
+library('biomaRt')
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+G_list <- getBM(filters= "ensembl_gene_id",
+                attributes= c("ensembl_gene_id", "hgnc_symbol"),values=unique(genExp.dt$ensgid),
+                mart= mart) %>% as.data.table()
+genExp.Symbol.dt <- merge(G_list[nchar(hgnc_symbol)>0, .(ensgid= ensembl_gene_id,geneSymbol=hgnc_symbol)], genExp.dt, by='ensgid') %>%
+  .[, lapply(.SD, mean),by=.(geneSymbol, BrodmannArea, UID, batch, sampleIdentifier), .SDcols=sapply(., is.numeric)]
+genExp.Symbol.dt[, scaleExp:=scale(value)[,1], by=UID]
+genExp.Symbol.dt[, sigmoidExp:=sigmoid(scaleExp)]
+
+## writing fils for 
+genExp.Symbol.dt %>% dcast(geneSymbol~UID, value.var='sigmoidExp', fill=0) %>%
+  rio::export('databases/2019_AD_MSBB/AD_MSBB_sigmoidExp.feather')
+genExp.Symbol.dt %>% dcast(geneSymbol~UID, value.var='scaleExp', fill=0) %>%
+  rio::export('databases/2019_AD_MSBB/AD_MSBB_scaleExp.feather')
+```
+
+```{r}
+all.aggr <- c('APP',
+              'ADAM10',
+              'BACE1',
+              'PSEN1')
+
+## run expression-guided random walk to generate RWR_secPs_summarized.csv 
+p_k_allSecretases.dt <- fread('output/2005_AD_all/MSBB_normExp_sigmoid/RWR_secPs_summarized.csv') %>% 
+  setnames(c('V1', 'V2', 'V3'), c('geneSymbol', 'UID', 'type')) %>% .[,type:=NULL]
+
+p_k_allSecretases.dt[, .(`amyloidogenic protein` = geneSymbol, UID, `support score` = secM_avg)] %>% fwrite('Tables/TableS_AD_MSBB.csv')
+genExp_allSecretases.dt <- genExp.Symbol.dt[geneSymbol%in%all.aggr, .(geneSymbol, UID, genExp=value)]
+p_k_variable='secM_avg'
+model.genExp <- 
+  merge(genExp_allSecretases.dt, p_k_allSecretases.dt[, .(geneSymbol, UID, p_k=get(p_k_variable))]) %>% 
+  dcast(UID~geneSymbol, value.var=c('genExp', 'p_k')) %>% 
+  merge(clin_RNA, by='UID')
+
+# model.genExp[, .(genExp_APP, p_k_ADAM10, p_k_NCSTN, p_k_PSEN1, p_k_APP, p_k_BACE1, p_k_BACE2, PlaqueMean, CDR, bbscore)] %>% psych::pairs.panels()
+
+model.dt <- cbind(model.genExp[, .(Subject_id = as.integer(factor(UID)),
+                                   gender = as.integer(factor(SEX)),
+                                   BrodmannArea_id = as.integer(factor(BrodmannArea)),
+                                   PlaqueMean = scale(PlaqueMean)[,1])],
+                  model.genExp[, scale(.SD), .SDcols=paste0('genExp_', all.aggr)],
+                  model.genExp[, scale(.SD), .SDcols=paste0('p_k_', all.aggr)]
+)
+
+
+model.factor.lookup <- model.genExp[, .(Subject_id = as.integer(factor(UID)),
+                                        UID,
+                                        gender = as.integer(factor(SEX)),
+                                        SEX,
+                                        BrodmannArea_id = as.integer(factor(BrodmannArea)),
+                                        BrodmannArea)] %>% unique
+
+# bulkRNA.data.list <- list(bulkRNA_model.dt = model.dt, 
+#                         bulkRNA_model.fac.lookup = model.factor.lookup)
+# saveRDS(bulkRNA.data.list, 'Figure2020/Revision/bulkRNA.data.list.RDS')
+m.multilevel3 <- ulam(
+  alist(
+    PlaqueMean ~ dnorm(mu, sigma),
+    mu <- a + 
+      b_RWR3_APP[BrodmannArea_id] * p_k_APP+ 
+      b_RWR3_ADAM10[BrodmannArea_id] * p_k_ADAM10+ 
+      b_RWR3_BACE1[BrodmannArea_id] * p_k_BACE1+ 
+      b_RWR3_PSEN1[BrodmannArea_id] * p_k_PSEN1+ 
+      b_genExp_APP[BrodmannArea_id] * genExp_APP+
+      b_genExp_ADAM10[BrodmannArea_id] * genExp_ADAM10+
+      b_genExp_BACE1[BrodmannArea_id] * genExp_BACE1+
+      b_genExp_PSEN1[BrodmannArea_id] * genExp_PSEN1,
+    
+    sigma ~ dexp(1),
+    a ~  dnorm(0, 1),
+    
+    c(b_RWR3_APP,b_genExp_APP)[BrodmannArea_id] ~ multi_normal(c(RWR3_APP_bar,b_genExp_APP_bar), Rho_APP, Sigma_APP),
+    c(b_RWR3_ADAM10,b_genExp_ADAM10)[BrodmannArea_id] ~ multi_normal(c(RWR3_ADAM10_bar,b_genExp_ADAM10_bar), Rho_ADAM10, Sigma_ADAM10),
+    c(b_RWR3_BACE1,b_genExp_BACE1)[BrodmannArea_id] ~ multi_normal(c(RWR3_BACE1_bar,b_genExp_BACE1_bar), Rho_BACE1, Sigma_BACE1),
+    c(b_RWR3_PSEN1,b_genExp_PSEN1)[BrodmannArea_id] ~ multi_normal(c(RWR3_PSEN1_bar,b_genExp_PSEN1_bar), Rho_PSEN1, Sigma_PSEN1),
+    
+    RWR3_APP_bar~normal(0,1),
+    RWR3_ADAM10_bar~normal(0,1),
+    RWR3_BACE1_bar~normal(0,1),
+    RWR3_PSEN1_bar~normal(0,1),
+    
+    b_genExp_APP_bar ~ dnorm(0, 1),
+    b_genExp_ADAM10_bar ~ dnorm(0, 1),
+    b_genExp_BACE1_bar ~ dnorm(0, 1),
+    b_genExp_PSEN1_bar ~ dnorm(0, 1),
+    
+    Sigma_APP~exponential(2),
+    Sigma_ADAM10~exponential(2),
+    Sigma_BACE1~exponential(2),
+    Sigma_PSEN1~exponential(2),
+    
+    Rho_APP~lkjcorr(2),
+    Rho_ADAM10~lkjcorr(2),
+    Rho_BACE1~lkjcorr(2),
+    Rho_PSEN1~lkjcorr(2)
+  ), data = model.dt, chains=16 , cores=16, control = list(adapt_delta = 0.99), iter = 10000
+)
+
+
+```
+
+
+```{r}
+plt.MSBB.panBrainRegion <- plot.dist.multilevel.secretases(m.multilevel3, model.factor.lookup = model.factor.lookup,with.interaction = F,
+                                                           genderID = 'gender',  genderLookup = 'SEX', cellTermID = 'BrodmannArea_id', 
+                                                           cellTermLookup = 'BrodmannArea',
+                                                           cellTermLookup_highlight = '_pan-cellType',
+                                                           plt.color = F) +
+  guides( fill=FALSE) +
+  theme_bw() %+replace% theme(axis.text.y=element_blank(),
+                              axis.ticks.y=element_blank()) + ylab('brain region average')
+plt.MSBB.allBrainRegions <- plot.dist.multilevel.secretases(m.multilevel3, model.factor.lookup = model.factor.lookup,with.interaction = F,
+                                                            genderID = 'gender',  genderLookup = 'SEX', cellTermID = 'BrodmannArea_id', 
+                                                            cellTermLookup = 'BrodmannArea',
+                                                            # cellTermLookup_highlight = '_pan-cellType',
+                                                            plt.color = F) +  ylab('brain region average') + theme_bw() %+replace% theme(legend.position = 'bottom')
+ggsave2(path.name = 'Figures/', file.name = 'FigS_ADcoef_MSBB_allBrainRegions', height = 7, width = 5, plot = plt.MSBB.allBrainRegions)
+```
+
+#Figure composition
+
+```{r}
+library(patchwork)
+combined.plt <- plt.Ast/plt.MSBB.panBrainRegion + plot_layout(heights = c(2.5, 3))+ plot_annotation(tag_levels = 'A')
+ggsave2(path.name = 'Figures/', file.name = 'Fig3_ADcoef', height = 8, width = 5, plot = combined.plt)
+```
+

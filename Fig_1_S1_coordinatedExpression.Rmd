@@ -1,0 +1,130 @@
+---
+title: "Figure generation"
+output: html_notebook
+---
+
+```{r}
+source('ppi_assist_func.R')
+source('graph_assist.R')
+library(igraph)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+```
+
+
+#Figure coordinated expression
+```{r}
+protein.data.source <- 'deep_proteome'
+secM.expr.col <- 'Proteins_iBAQ.rank.gene'
+# used.int.g <- 'Humannet'
+# use.tissue.median <- T
+source('auxiliary_file/graph_based/load_components_tissuemedian.R')
+source('auxiliary_file/180124_humanSecSupporting.R')
+library(ggpmisc)
+library(ggpubr)
+
+load_components(protein.data.source = 'HPA', use.tissue.median = F, return.omics.only = T)
+
+GTEx.tpm.dt <- fread('databases/GTEx_Analysis_2016-01-15_v7_RNASeQCv1.1.8_gene_median_tpm.gct') %>% 
+  .[, c('Description', 'gene_id','ensgid'):=.(NULL, NULL, tstrsplit(gene_id, '\\.')[[1]])] 
+
+GTEx.tpm.dt.m <- GTEx.tpm.dt %>% melt(id.vars = 'ensgid', value.name = 'tpm', variable.name = 'tissue')
+GTEx.geneVarCoef <- GTEx.tpm.dt.m[, .(tissue.var.coef = var(tpm)/mean(tpm),
+                                      tissue.mean = mean(tpm),
+                                      tissue.var = var(tpm)), by = 'ensgid']
+GTEx.tpm.dt <- dcast(GTEx.tpm.dt.m, ensgid~tissue, value.var = 'tpm')
+## gene filtering
+GTEx.tpm.dt <- GTEx.tpm.dt[GTEx.geneVarCoef[tissue.var>0, ensgid], on = 'ensgid']
+
+GTEx.tissues <- names(GTEx.tpm.dt)[sapply(GTEx.tpm.dt, is.numeric)]
+```
+
+# secP vs all genes
+## tissue median
+```{r}
+library(dendextend)
+
+dend.allgenes <- GTEx.tpm.dt[, c('ensgid', GTEx.tissues), with = F] %>%
+  dt.to.df() %>% t %>% scale %>%  dist %>% hclust %>% dendsort::dendsort() %>% as.dendrogram()
+tissue.var.coef.cutoff <- 6
+## GTEx samples
+secP.df <- GTEx.tpm.dt[ensgid%in%HPA.secretory_membrane$Gene, c('ensgid', GTEx.tissues), with = F] %>% dt.to.df()
+secP.high.var.df <- GTEx.tpm.dt[GTEx.geneVarCoef[ensgid%in%HPA.secretory_membrane$Gene & 
+                                                   tissue.var.coef>tissue.var.coef.cutoff,
+                                                 ensgid], on = 'ensgid'] %>% dt.to.df(rn.col = 'ensgid')
+secM.df <- GTEx.tpm.dt[ensgid%in%secM.amir$ensgid, c('ensgid', GTEx.tissues), with = F] %>%  dt.to.df() 
+secM.high.var.df <- GTEx.tpm.dt[GTEx.geneVarCoef[ensgid%in%secM.amir$ensgid & 
+                                                   tissue.var.coef>tissue.var.coef.cutoff,
+                                                 ensgid], on = 'ensgid'] %>% dt.to.df(rn.col = 'ensgid')
+## HPA samples
+HPA.dt <- fread('databases/rna_tissue_hpa.tsv') %>% dcast( `Gene name`~Tissue, value.var='pTPM', fun.aggregate=mean)
+HPA.secP.df <- HPA.dt[`Gene name`%in%HPA.secretory_membrane$`Gene name`] %>% dt.to.df(rn.col = 'Gene name')
+HPA.secM.df <- HPA.dt[`Gene name`%in%secM.amir$Symbol] %>% dt.to.df(rn.col = 'Gene name')
+## robustness analysis
+### correlation analysis
+# dl.secPsecM.GTEx.tissue.median <- dendlist(dend.secP, dend.secM)
+robust.cor.bakers.gamma <- function(dend1, sample.gene.count, n.iter = 1000, sample.replace = T,
+                                    expr.dt=GTEx.tpm.dt, expr.cols = GTEx.tissues,
+                                    transformation = function(x){x}) {
+  # cor_bakers_gamma_results <- numeric(n.iter)
+  cor_bakers_gamma_results <- parallel::mclapply(1:n.iter, function(x){
+    cor_bakers_gamma(dend1,
+                     expr.dt[sample(nrow(expr.dt), sample.gene.count, replace = sample.replace), 
+                             c(expr.cols), with = F] %>%
+                       as.matrix() %>% transformation %>% t %>% scale %>%  dist %>% hclust %>%  as.dendrogram()
+    )}, mc.cores = 32) %>% unlist
+  
+  return(cor_bakers_gamma_results)
+  
+}
+
+dend.compare <- function(secM.df, secP.df, transformation = function(x){x}, common_subtrees_color_lines=T, ...) {
+  secM.count <- secM.df %>% nrow
+  secP.count <- secP.df %>% nrow
+  
+  dend.secP <-
+    secP.df %>% transformation %>% t %>% scale %>% dist %>% hclust %>% dendsort::dendsort() %>% as.dendrogram()
+  dend.secM <- 
+    secM.df %>% transformation %>% t %>% scale %>% dist %>% hclust %>% dendsort::dendsort() %>% as.dendrogram()
+  secP.df %>% transformation  %>% cor() %>% 
+    pheatmap::pheatmap(clustering_distance_rows = secM.df %>% transformation %>% t %>% scale %>% dist,
+                       clustering_distance_cols = secP.df %>% transformation %>% t %>% scale %>% dist, 
+                       clustering_callback = function(hc, mat){hc %>% dendsort::dendsort(isReverse = T)},
+                       cellwidth=8, cellheight=8)
+  
+  r.secP.secM <- cor_bakers_gamma(dend.secM, dend.secP)
+  
+  dendlist(dend.secP, dend.secM) %>% # untangle() %>%
+    tanglegram( common_subtrees_color_branches = F, margin_inner = 18, columns_width = c(5, 1.5, 5),
+                main_left = 'secP', 
+                main_right = 'secM', 
+                sub = sprintf("Baker's Gamma Index: %s", round(r.secP.secM, 4)), cex_sub = 1, 
+                highlight_distinct_edges  = F, 
+                highlight_branches_lwd = F, common_subtrees_color_lines=common_subtrees_color_lines)
+  
+  r.empirical.shuffle.secM <- robust.cor.bakers.gamma(dend.secP, sample.gene.count = secM.count, n.iter = 2000, transformation = transformation, ...)
+  r.empirical.shuffle.secP <- robust.cor.bakers.gamma(dend.secM, sample.gene.count = secP.count, n.iter = 2000, transformation = transformation, ...)
+  pv.shuffle.secM <- round(sum(r.secP.secM < r.empirical.shuffle.secM)/length(r.empirical.shuffle.secM), 4)
+  pv.shuffle.secP <- round(sum(r.secP.secM < r.empirical.shuffle.secP)/length(r.empirical.shuffle.secP), 4)
+  pv.dt <- data.table(pv = c(pv.shuffle.secM, pv.shuffle.secP), y = c((pv.shuffle.secM<pv.shuffle.secP)+.5,
+                                                                      (pv.shuffle.secP<pv.shuffle.secM)+.5),
+                      shuffle.by = c('secM', 'secP'))
+  rbind(data.table(empirical.gamma = r.empirical.shuffle.secM, shuffle.by = 'secM', pv = pv.shuffle.secM),
+        data.table(empirical.gamma = r.empirical.shuffle.secP, shuffle.by = 'secP', pv = pv.shuffle.secP)) %>% 
+    .[shuffle.by == 'secM'] %>% 
+    ggplot(aes(empirical.gamma, color = shuffle.by, fill = shuffle.by)) + geom_vline(xintercept = r.secP.secM, linetype = 2, alpha = .5) + xlab("Baker's Gamma Index") + 
+    geom_density(alpha = 0.1) + 
+    geom_text(data = pv.dt[shuffle.by == 'secM'], aes(x=r.secP.secM, y=y, label=paste0('1-sided pv: ', pv))) + theme_classic()+ theme(legend.position="none") 
+}
+
+pdf('Fig1_GTEx_dend.compare_tissue.pdf', width = 8, height = 6)
+set.seed(5)
+dend.compare(secP.df, secM.df, transformation = function(x){log(1+x)}, common_subtrees_color_lines=F)
+dev.off()
+pdf('FigS1_HPA_dend.compare_tissue.pdf', width = 8, height = 6)
+set.seed(5)
+dend.compare(HPA.secP.df, HPA.secM.df, transformation = function(x){log(.1+x)}, common_subtrees_color_lines=F, expr.dt=HPA.dt, expr.cols=HPA.dt[, names(.SD),.SDcols=-c('Gene name')])
+dev.off()
+```
+
