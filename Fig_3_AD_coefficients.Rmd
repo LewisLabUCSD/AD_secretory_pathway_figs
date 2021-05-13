@@ -98,7 +98,6 @@ model.dt_ReactAst <- RWR_raw.clinVar.dt_ReactAst2[!is.na(pmi), .(Subject_id = as
                                                                  CDR = scale(CDR)[,1],
                                                                  Broad_cellType = as.integer(factor(broad.cell.type)),
                                                                  Broad_cellType_react = as.integer(factor(broad.cell.type.react)),
-                                                                 # Subcluster = as.integer(factor(Subcluster)),
                                                                  amyloid = scale(amyloid)[,1],
                                                                  tangles = scale(tangles)[,1],
                                                                  plaq_n = scale(plaq_n)[,1],
@@ -125,8 +124,6 @@ model.factor.lookup_ReactAst <- RWR_raw.clinVar.dt_ReactAst2[!is.na(pmi), .(Subj
                                                                             pathology.group,
                                                                             AD_control = ifelse(pathology.group=='no-pathology', 1, 2),
                                                                             ad_control = ifelse(pathology.group=='no-pathology', 'control', 'AD')
-                                                                            # Subcluster = as.integer(factor(Subcluster)),
-                                                                            # Subcluster
 )] %>% unique #%>% na.omit()
 
 options(mc.cores = parallel::detectCores())
@@ -163,11 +160,8 @@ m.multilevel.amyloid_ReactAst2_pmi_ADcontrol2 <- ulam(
     b_age~dnorm(0,1),
     vector[2]:b_RWR3[Broad_cellType_react] ~ multi_normal(0, Rho_RWR3, b_RWR3_sigma),
     Rho_RWR3 ~ dlkjcorr(4),
-    # b_RWR3_bar ~ dnorm(0, 1),
     b_RWR3_sigma ~ dexp(1),
-    # vector[2]:b_genExp[Broad_cellType] ~ multi_normal(0, Rho_genExp, b_genExp_sigma),
     b_genExp[Broad_cellType_react] ~ dnorm(b_genExp_bar, b_genExp_sigma),
-    # Rho_genExp ~ dlkjcorr(4),
     b_genExp_bar ~ dnorm(0, 1),
     b_genExp_sigma ~ dexp(1)
   ), data = model.dt_ReactAst, chains=16 , cores=16, cmdstan = T
